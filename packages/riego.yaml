@@ -1,0 +1,236 @@
+# ============================================================
+#  SISTEMA DE RIEGO DEL CÉSPED
+#  Todo (helpers, scripts, automatizaciones, sensores) vive acá
+# ============================================================
+
+# ---------- MODOS (perillas ON/OFF) ----------
+input_boolean:
+  riego_modo_germinacion:
+    name: "Riego · Modo germinación"
+    icon: mdi:sprout
+  riego_vacaciones:
+    name: "Riego · Vacaciones (pausa total)"
+    icon: mdi:airplane
+  riego_notificaciones:
+    name: "Riego · Notificaciones"
+    icon: mdi:bell
+
+# ---------- NÚMEROS (duraciones y umbrales de clima) ----------
+input_number:
+  riego_duracion_germinacion:
+    name: "Riego · Duración germinación (min)"
+    min: 1
+    max: 60
+    step: 1
+    unit_of_measurement: "min"
+    icon: mdi:timer-sand
+  riego_duracion_mantenimiento:
+    name: "Riego · Duración mantenimiento (min)"
+    min: 1
+    max: 90
+    step: 1
+    unit_of_measurement: "min"
+    icon: mdi:timer-sand
+  riego_umbral_lluvia_mm:
+    name: "Riego · Umbral lluvia (mm)"
+    min: 0
+    max: 30
+    step: 0.5
+    unit_of_measurement: "mm"
+    icon: mdi:weather-rainy
+  riego_umbral_temp_min:
+    name: "Riego · Temp mínima (°C)"
+    min: -5
+    max: 15
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer-low
+  riego_umbral_viento_max:
+    name: "Riego · Viento máximo (km/h)"
+    min: 5
+    max: 60
+    step: 1
+    unit_of_measurement: "km/h"
+    icon: mdi:weather-windy
+  riego_umbral_calor:
+    name: "Riego · Temp calor extra (°C)"
+    min: 20
+    max: 45
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer-high
+
+# ---------- REGISTRO ----------
+input_datetime:
+  riego_ultimo:
+    name: "Riego · Último riego"
+    has_date: true
+    has_time: true
+    icon: mdi:history
+
+# ---------- SCRIPTS ----------
+script:
+  regar_cesped:
+    alias: "Riego · Regar césped"
+    icon: mdi:sprinkler-variant
+    mode: single
+    fields:
+      duracion_min:
+        description: "Minutos de riego (opcional; si no se indica, usa la duración del modo activo)"
+        example: 6
+        selector:
+          number:
+            min: 1
+            max: 90
+            unit_of_measurement: min
+    variables:
+      minutos: "{{ (duracion_min | default(0) | int(0)) if (duracion_min | default(0) | int(0)) > 0 else (states('input_number.riego_duracion_germinacion') | int if is_state('input_boolean.riego_modo_germinacion','on') else states('input_number.riego_duracion_mantenimiento') | int) }}"
+      segundos: "{{ (minutos | int) * 60 }}"
+    sequence:
+      - action: notify.mobile_app_iphone_de_gaston
+        data:
+          title: "🌱 Riego iniciado"
+          message: "Regando el césped durante {{ minutos }} min."
+      - action: mqtt.publish
+        data:
+          topic: "zigbee2mqtt/Riego/set"
+          payload: '{"cyclic_timed_irrigation":{"current_count":0,"total_number":1,"irrigation_duration":{{ segundos }},"irrigation_interval":0}}'
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.riego_ultimo
+        data:
+          datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+  parar_riego:
+    alias: "Riego · Parar ahora"
+    icon: mdi:stop-circle
+    mode: single
+    sequence:
+      - action: mqtt.publish
+        data:
+          topic: "zigbee2mqtt/Riego/set"
+          payload: '{"state":"OFF"}'
+
+# ---------- AUTOMATIZACIONES DE SEGURIDAD ----------
+# Nota: la válvula NO soporta "auto_close_when_water_shortage" (firmware < 1.0.4).
+# La seguridad la dan el ciclo interno (la válvula se cierra sola) + el watchdog.
+automation:
+  # 1) Watchdog: si sale agua de forma continua demasiado tiempo, cerrar y avisar
+  - id: riego_seguridad_watchdog
+    alias: "Riego · Watchdog anti-inundación"
+    description: "Última línea de defensa: si el caudal está por encima de 0 más de 45 min seguidos, cierra la válvula."
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.riego_flow
+        above: 0
+        for:
+          minutes: 45
+    actions:
+      - action: script.parar_riego
+      - action: notify.mobile_app_iphone_de_gaston
+        data:
+          title: "🚨 Riego cortado por seguridad"
+          message: "La válvula estuvo dejando pasar agua más de 45 min seguidos. La cerré por las dudas — revisá que esté todo bien."
+
+  # 3) Aviso de batería baja de la válvula
+  - id: riego_bateria_baja
+    alias: "Riego · Aviso de batería baja"
+    description: "Avisa cuando la batería de la válvula baja del 20%."
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.riego_battery
+        below: 20
+    actions:
+      - action: notify.mobile_app_iphone_de_gaston
+        data:
+          title: "🔋 Batería baja en la válvula de riego"
+          message: "La válvula está al {{ states('sensor.riego_battery') }}%. Cambiá o recargá las pilas pronto para no quedarte sin riego."
+
+  # 4) GERMINACIÓN: riego diario al amanecer (salvo lluvia/frío/viento)
+  - id: riego_germinacion_diario
+    alias: "Riego · Germinación (amanecer)"
+    description: "En modo germinación riega al amanecer+30min, salvo que llueva, vaya a llover, haga frío o mucho viento."
+    triggers:
+      - trigger: sun
+        event: sunrise
+        offset: "00:30:00"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.riego_modo_germinacion
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.riego_vacaciones
+        state: "off"
+    variables:
+      lluvia_ahora: "{{ states('sensor.openweathermap_rain_intensity') | float(0) }}"
+      lluvia_hoy: "{{ states('sensor.riego_lluvia_caida_hoy') | float(0) }}"
+      lluvia_prox: "{{ states('sensor.riego_lluvia_proximas_12h') | float(0) }}"
+      temp: "{{ states('sensor.openweathermap_temperature') | float(20) }}"
+      viento: "{{ states('sensor.openweathermap_wind_speed') | float(0) }}"
+      umbral_lluvia: "{{ states('input_number.riego_umbral_lluvia_mm') | float(3) }}"
+      umbral_temp: "{{ states('input_number.riego_umbral_temp_min') | float(4) }}"
+      umbral_viento: "{{ states('input_number.riego_umbral_viento_max') | float(30) }}"
+      motivo: >-
+        {% if lluvia_ahora > 0 %}está lloviendo
+        {%- elif lluvia_hoy >= umbral_lluvia %}ya llovió {{ lluvia_hoy | round(1) }} mm hoy
+        {%- elif lluvia_prox >= umbral_lluvia %}se esperan {{ lluvia_prox | round(1) }} mm en las próximas horas
+        {%- elif temp < umbral_temp %}hace frío ({{ temp | round(0) }}°C)
+        {%- elif viento > umbral_viento %}hay mucho viento ({{ viento | round(0) }} km/h)
+        {%- else %}{% endif %}
+    actions:
+      - if:
+          - condition: template
+            value_template: "{{ (motivo | trim) == '' }}"
+        then:
+          - action: script.regar_cesped
+        else:
+          - if:
+              - condition: state
+                entity_id: input_boolean.riego_notificaciones
+                state: "on"
+            then:
+              - action: notify.mobile_app_iphone_de_gaston
+                data:
+                  title: "☔ Riego cancelado"
+                  message: "No regué el césped porque {{ motivo | trim }}."
+
+# ---------- SENSORES DE CLIMA (para decidir cuándo NO regar) ----------
+
+# 1) Lluvia PRONOSTICADA para las próximas 12 h (mm)
+template:
+  - trigger:
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        minutes: "/15"
+    action:
+      - action: weather.get_forecasts
+        target:
+          entity_id: weather.openweathermap
+        data:
+          type: hourly
+        response_variable: pron
+    sensor:
+      - name: "Riego · Lluvia próximas 12h"
+        unique_id: riego_lluvia_prox_12h
+        unit_of_measurement: "mm"
+        state_class: measurement
+        icon: mdi:weather-pouring
+        state: "{{ ((pron['weather.openweathermap']['forecast'][:12] | map(attribute='precipitation') | map('float', 0) | sum) | round(1)) if pron is defined else 0 }}"
+
+# 2) Lluvia REAL acumulada (integra rain_intensity mm/h -> mm, monótona)
+sensor:
+  - platform: integration
+    source: sensor.openweathermap_rain_intensity
+    name: "Riego lluvia acumulada total"
+    unique_id: riego_lluvia_acumulada_total
+    unit_time: h
+    method: left
+    round: 2
+
+# 3) Lluvia caída HOY (se reinicia a medianoche)
+utility_meter:
+  riego_lluvia_hoy:
+    source: sensor.riego_lluvia_acumulada_total
+    name: "Riego · Lluvia caída hoy"
+    cycle: daily
